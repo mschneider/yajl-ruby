@@ -33,22 +33,27 @@
  return rb_yajl_encoder_encode(1, &self, rb_encoder);     \
 
 /* Helpers for building objects */
-inline void yajl_check_and_fire_callback(void * ctx) {
+inline void yajl_check_and_fire_complete_callback(void * ctx) {
     yajl_parser_wrapper * wrapper;
     GetParser((VALUE)ctx, wrapper);
 
-    /* No need to do any of this if the callback isn't even setup */
-    if (wrapper->parse_complete_callback != Qnil) {
-        int len = RARRAY_LEN(wrapper->builderStack);
-        if (len == 1 && wrapper->nestedArrayLevel == 0 && wrapper->nestedHashLevel == 0) {
-            rb_funcall(wrapper->parse_complete_callback, intern_call, 1, rb_ary_pop(wrapper->builderStack));
-        }
-    } else {
-        int len = RARRAY_LEN(wrapper->builderStack);
-        if (len == 1 && wrapper->nestedArrayLevel == 0 && wrapper->nestedHashLevel == 0) {
-            wrapper->objectsFound++;
-            if (wrapper->objectsFound > 1) {
-                rb_raise(cParseError, "%s", "Found multiple JSON objects in the stream but no block or the on_parse_complete callback was assigned to handle them.");
+    if (wrapper->nestedArrayLevel == 0 && wrapper->nestedHashLevel == 0) {
+        if (wrapper->eventsOnly) {
+            if (wrapper->parse_complete_callback != Qnil) {
+                rb_funcall(wrapper->parse_complete_callback, intern_call, 0);
+            }
+        } else {
+            if (RARRAY_LEN(wrapper->builderStack) == 1) {
+                if (wrapper->parse_complete_callback != Qnil) {
+                    rb_funcall(wrapper->parse_complete_callback, intern_call, 1, rb_ary_pop(wrapper->builderStack));
+                } else {
+                    wrapper->objectsFound++;
+                    if (wrapper->objectsFound > 1) {
+                        rb_raise(cParseError, "%s", "Found multiple JSON objects in the stream but no block or the on_parse_complete callback was assigned to handle them.");
+                    }
+                }
+            } else {
+                rb_raise(cParseError, "Parser Stack has an unexpexted depth(is: %ld / should be: 1).", RARRAY_LEN(wrapper->builderStack));
             }
         }
     }
@@ -104,8 +109,10 @@ inline int yajl_found_value(void * ctx, VALUE val) {
     if (wrapper->parse_value_callback != Qnil) {
          rb_funcall(wrapper->parse_value_callback, intern_call, 1, val);
     }
-    yajl_set_static_value(ctx, val);
-    yajl_check_and_fire_callback(ctx);
+    if (!wrapper->eventsOnly) {
+        yajl_set_static_value(ctx, val);
+    }
+    yajl_check_and_fire_complete_callback(ctx);
     return 1;
 }
 
@@ -295,6 +302,11 @@ static int yajl_found_hash_key(void * ctx, const unsigned char * stringVal, unsi
 #ifdef HAVE_RUBY_ENCODING_H
     rb_encoding *default_internal_enc = rb_default_internal_encoding();
 #endif
+    GetParser((VALUE)ctx, wrapper);
+    if (wrapper->eventsOnly && wrapper->parse_key_callback == Qnil) {
+        return 1;
+    }
+
     key = rb_str_new((const char *)stringVal, stringLen);
 #ifdef HAVE_RUBY_ENCODING_H
     rb_enc_associate(key, utf8Encoding);
@@ -303,7 +315,6 @@ static int yajl_found_hash_key(void * ctx, const unsigned char * stringVal, unsi
     }
 #endif
 
-    GetParser((VALUE)ctx, wrapper);
     if (wrapper->symbolizeKeys) {
         key = ID2SYM(rb_to_id(key));
     }
@@ -311,7 +322,6 @@ static int yajl_found_hash_key(void * ctx, const unsigned char * stringVal, unsi
         rb_funcall(wrapper->parse_key_callback, intern_call, 1, key);
     }
     yajl_set_static_value(ctx, key);
-    yajl_check_and_fire_callback(ctx);
     return 1;
 }
 
@@ -320,7 +330,9 @@ static int yajl_found_start_hash(void * ctx) {
     GetParser((VALUE)ctx, wrapper);
     yajl_fire_callback(wrapper->object_begin_callback);
     wrapper->nestedHashLevel++;
-    yajl_set_static_value(ctx, rb_hash_new());
+    if (!wrapper->eventsOnly) {
+        yajl_set_static_value(ctx, rb_hash_new());
+    }
     return 1;
 }
 
@@ -329,10 +341,12 @@ static int yajl_found_end_hash(void * ctx) {
     GetParser((VALUE)ctx, wrapper);
     yajl_fire_callback(wrapper->object_end_callback);
     wrapper->nestedHashLevel--;
-    if (RARRAY_LEN(wrapper->builderStack) > 1) {
-        rb_ary_pop(wrapper->builderStack);
+    if (!wrapper->eventsOnly) {
+        if (RARRAY_LEN(wrapper->builderStack) > 1) {
+            rb_ary_pop(wrapper->builderStack);
+        }
     }
-    yajl_check_and_fire_callback(ctx);
+    yajl_check_and_fire_complete_callback(ctx);
     return 1;
 }
 
@@ -341,7 +355,9 @@ static int yajl_found_start_array(void * ctx) {
     GetParser((VALUE)ctx, wrapper);
     yajl_fire_callback(wrapper->array_begin_callback);
     wrapper->nestedArrayLevel++;
-    yajl_set_static_value(ctx, rb_ary_new());
+    if (!wrapper->eventsOnly) {
+        yajl_set_static_value(ctx, rb_ary_new());
+    }
     return 1;
 }
 
@@ -350,10 +366,12 @@ static int yajl_found_end_array(void * ctx) {
     GetParser((VALUE)ctx, wrapper);
     yajl_fire_callback(wrapper->array_end_callback);
     wrapper->nestedArrayLevel--;
-    if (RARRAY_LEN(wrapper->builderStack) > 1) {
-        rb_ary_pop(wrapper->builderStack);
+    if (!wrapper->eventsOnly) {
+        if (RARRAY_LEN(wrapper->builderStack) > 1) {
+            rb_ary_pop(wrapper->builderStack);
+        }
     }
-    yajl_check_and_fire_callback(ctx);
+    yajl_check_and_fire_complete_callback(ctx);
     return 1;
 }
 
@@ -378,12 +396,14 @@ static int yajl_found_end_array(void * ctx) {
  * :allow_comments will turn on/off the check for comments inside the JSON stream, defaults to true.
  *
  * :check_utf8 will validate UTF8 characters found in the JSON stream, defaults to true.
+ *
+ * :only_events will turn off creation of the parsed object graph and only generate the needed objects to call the set callbacks, defaults to false.
  */
 static VALUE rb_yajl_parser_new(int argc, VALUE * argv, VALUE klass) {
     yajl_parser_wrapper * wrapper;
     yajl_parser_config cfg;
     VALUE opts, obj;
-    int allowComments = 1, checkUTF8 = 1, symbolizeKeys = 0;
+    int allowComments = 1, checkUTF8 = 1, symbolizeKeys = 0, eventsOnly = 0;
 
     /* Scan off config vars */
     if (rb_scan_args(argc, argv, "01", &opts) == 1) {
@@ -398,6 +418,9 @@ static VALUE rb_yajl_parser_new(int argc, VALUE * argv, VALUE klass) {
         if (rb_hash_aref(opts, sym_symbolize_keys) == Qtrue) {
             symbolizeKeys = 1;
         }
+        if (rb_hash_aref(opts, sym_events_only) == Qtrue) {
+            eventsOnly = 1;
+        }
     }
     cfg = (yajl_parser_config){allowComments, checkUTF8};
 
@@ -406,6 +429,7 @@ static VALUE rb_yajl_parser_new(int argc, VALUE * argv, VALUE klass) {
     wrapper->nestedArrayLevel = 0;
     wrapper->nestedHashLevel = 0;
     wrapper->objectsFound = 0;
+    wrapper->eventsOnly = eventsOnly;
     wrapper->symbolizeKeys = symbolizeKeys;
     wrapper->builderStack = rb_ary_new();
     wrapper->parse_complete_callback = Qnil;
@@ -493,12 +517,11 @@ static VALUE rb_yajl_parser_parse(int argc, VALUE * argv, VALUE self) {
     /* parse any remaining buffered data */
     stat = yajl_parse_complete(wrapper->parser);
 
-    if (wrapper->parse_complete_callback != Qnil) {
-        yajl_check_and_fire_callback((void *)self);
+    if (wrapper->parse_complete_callback != Qnil || wrapper->eventsOnly) {
         return Qnil;
+    } else {
+        return rb_ary_pop(wrapper->builderStack);
     }
-
-    return rb_ary_pop(wrapper->builderStack);
 }
 
 /*
@@ -539,7 +562,7 @@ static VALUE rb_yajl_parser_parse_chunk(VALUE self, VALUE chunk) {
  *
  * This callback setter allows you to pass a Proc/lambda or any other object that responds to #call.
  *
- * It will pass a single parameter, the ruby object built from the last parsed JSON object
+ * It will pass a single parameter, the ruby object built from the last parsed JSON object, unless events_only is True.
  */
 static VALUE rb_yajl_parser_set_complete_cb(VALUE self, VALUE callback) {
     yajl_parser_wrapper * wrapper;
@@ -1018,6 +1041,7 @@ void Init_yajl() {
     sym_html_safe = ID2SYM(rb_intern("html_safe"));
     sym_terminator = ID2SYM(rb_intern("terminator"));
     sym_symbolize_keys = ID2SYM(rb_intern("symbolize_keys"));
+    sym_events_only = ID2SYM(rb_intern("events_only"));
 
 #ifdef HAVE_RUBY_ENCODING_H
     utf8Encoding = rb_utf8_encoding();
